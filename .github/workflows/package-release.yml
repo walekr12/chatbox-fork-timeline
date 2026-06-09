@@ -1,0 +1,167 @@
+name: Package and publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, for example v1.20.3-timeline.1'
+        required: true
+        type: string
+      prerelease:
+        description: 'Publish as prerelease'
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CI: true
+  UPDATE_CHANNEL: latest
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      release_name: ${{ steps.release.outputs.release_name }}
+    steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_PRERELEASE: ${{ github.event.inputs.prerelease }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          RUN_NUMBER: ${{ github.run_number }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${INPUT_TAG}"
+            prerelease="${INPUT_PRERELEASE}"
+          elif [[ "${REF_TYPE}" == "tag" ]]; then
+            tag="${REF_NAME}"
+            prerelease="false"
+          else
+            short_sha="${SHA:0:7}"
+            safe_ref="$(printf '%s' "${REF_NAME}" | tr '/_' '--' | tr -cd 'A-Za-z0-9.-')"
+            tag="auto-${safe_ref}-${RUN_NUMBER}-${short_sha}"
+            prerelease="true"
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "release_name=Chatbox ${tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: ${tag} (prerelease=${prerelease})"
+
+  package:
+    name: Package ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            build_command: pnpm exec electron-builder build --linux AppImage deb --x64 --publish never --config.npmRebuild=false
+            artifact_glob: |
+              release/build/*.AppImage
+              release/build/*.deb
+              release/build/latest-linux*.yml
+          - name: macos-universal
+            os: macos-latest
+            build_command: pnpm exec electron-builder build --mac --universal --publish never --config.npmRebuild=false
+            artifact_glob: |
+              release/build/*.dmg
+              release/build/*.zip
+              release/build/latest-mac*.yml
+          - name: windows-x64
+            os: windows-latest
+            build_command: pnpm exec electron-builder build --win nsis --x64 --publish never --config.npmRebuild=false
+            artifact_glob: |
+              release/build/*.exe
+              release/build/latest.yml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+
+      - name: Install pnpm
+        run: |
+          npm install --global pnpm@10.33.0
+          pnpm --version
+
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools rpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build app
+        run: pnpm run build
+
+      - name: Package app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ${{ matrix.build_command }}
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatbox-${{ matrix.name }}
+          path: ${{ matrix.artifact_glob }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - prepare
+      - package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List release artifacts
+        run: find artifacts -maxdepth 3 -type f -print | sort
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
